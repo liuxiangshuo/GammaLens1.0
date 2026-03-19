@@ -30,6 +30,10 @@ Thumbs.db
 *.log
 *.tmp
 *.temp
+smoke_log.txt
+smoke_test_result.txt
+test_compile.txt
+tools/mvp_log.txt
 
 # Python tooling cache (tools/)
 __pycache__/
