@@ -1,0 +1,6 @@
+run_id,scenario_id,event_id,label,confidence,notes
+run_20260101_120000,dark_static,evt_0001,tp,0.9,weak pulse confirmed
+run_20260101_120000,dark_static,evt_0002,fp,0.8,thermal noise spike
+run_20260101_120000,dark_static,session,fn_proxy,0.6,expected weak source not detected for 20s
+run_20260102_101010,dark_light_motion,evt_0001,fp,0.9,motion-induced false trigger
+run_20260102_101010,ambient_light,session,fn_proxy,0.7,no-radiation bootstrap sample

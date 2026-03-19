@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/nav_live" android:icon="@drawable/ic_nav_live" android:title="@string/tab_live" />
+    <item android:id="@+id/nav_events" android:icon="@drawable/ic_nav_events" android:title="@string/tab_events" />
+    <item android:id="@+id/nav_spectrum" android:icon="@drawable/ic_nav_spectrum" android:title="@string/tab_spectrum" />
+    <item android:id="@+id/nav_calibration" android:icon="@drawable/ic_nav_calibration" android:title="@string/tab_calibration" />
+    <item android:id="@+id/nav_debug" android:icon="@drawable/ic_nav_settings" android:title="@string/tab_debug" />
+</menu>

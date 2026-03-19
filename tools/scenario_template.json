@@ -1,0 +1,58 @@
+{
+  "scenarios": [
+    {
+      "id": "dark_static",
+      "description": "镜头遮光且设备静止",
+      "duration_sec": 180,
+      "expected": {
+        "false_positive_trend": "down",
+        "recall_trend": "up_or_equal",
+        "poor_ratio": "<=0.10"
+      }
+    },
+    {
+      "id": "dark_light_motion",
+      "description": "镜头遮光但设备轻微移动",
+      "duration_sec": 180,
+      "expected": {
+        "false_positive_trend": "down",
+        "reliability_state": "LIMITED"
+      }
+    },
+    {
+      "id": "ambient_light",
+      "description": "未遮光环境光场景",
+      "duration_sec": 180,
+      "expected": {
+        "false_positive_trend": "significantly_down",
+        "reliability_state": "POOR",
+        "ui_hint": "当前结果不可靠"
+      }
+    }
+  ],
+  "targets": {
+    "false_positive_drop": ">=12%",
+    "recall_improvement": ">=2%",
+    "process_ms_budget": "<=+8%"
+  },
+  "batch_eval": {
+    "experimentId": "prod",
+    "variantId": "balanced",
+    "scenarioId": "dark_static",
+    "base_group": "baseline",
+    "parameter_groups": [
+      "baseline",
+      "prod_balanced"
+    ],
+    "metrics": [
+      "poorRatio",
+      "meanRate60s",
+      "f1Proxy",
+      "cusumScore",
+      "hotPixelMapHitCount",
+      "processMsAvg",
+      "fps"
+    ]
+  }
+}
+

@@ -1,0 +1,45 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# APK / AAB / signing
+*.apk
+*.aab
+*.ap_
+*.jks
+*.keystore
+
+# Native / symbol artifacts
+*.so
+*.o
+*.obj
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Python tooling cache (tools/)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Project runtime artifacts
+runs/
+tools/reports/
+
+# Cursor local files
+.cursor/

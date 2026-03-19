@@ -1,0 +1,34 @@
+{
+  "current": {
+    "baseline": "v8-r0-nomodel-prod",
+    "candidate": "v8-r3-nomodel-prod",
+    "promoted": "v8-r3-nomodel-prod"
+  },
+  "history": [
+    {
+      "modelVersion": "v7a-r0-nomodel",
+      "releaseState": "baseline",
+      "note": "v7a zero-radiation bootstrap baseline"
+    },
+    {
+      "modelVersion": "v7a-r1-nomodel",
+      "releaseState": "candidate",
+      "note": "feature-lite enabled, rollback by disabling featureLiteEnabled"
+    },
+    {
+      "modelVersion": "v7a-r1-nomodel-prod",
+      "releaseState": "promoted",
+      "note": "productized balanced configuration"
+    },
+    {
+      "modelVersion": "v8-r0-nomodel-prod",
+      "releaseState": "candidate",
+      "note": "v8: spatial ROI weighting, multi-frame stacking, Poisson arrival test; rollback by disabling roiWeightEnabled/frameStackEnabled/poissonCheckEnabled"
+    },
+    {
+      "modelVersion": "v8-r3-nomodel-prod",
+      "releaseState": "candidate",
+      "note": "v8-r1: poisson startup guard, adaptive stack params, roi-stack order option, reliability feedback and accessibility improvements"
+    }
+  ]
+}

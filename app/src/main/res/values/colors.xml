@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand_primary">#1F6FEB</color>
+    <color name="brand_primary_dark">#134AA7</color>
+    <color name="brand_secondary">#00B8A9</color>
+    <color name="surface_dark">#0F141B</color>
+    <color name="surface_card">#CC111A22</color>
+    <color name="surface_card_stroke">#33FFFFFF</color>
+    <color name="text_primary">#F2F7FF</color>
+    <color name="text_secondary">#B8C7DA</color>
+    <color name="risk_green">#4CD964</color>
+    <color name="risk_yellow">#FFD166</color>
+    <color name="risk_red">#FF6B6B</color>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
