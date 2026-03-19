@@ -233,9 +233,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        sharedSync = FrameSynchronizer(enablePairing = false).apply {
-            setPairWindowNs(detectionConfig.dualPairWindowNs)
-        }
         calibrationRepository = DeviceCalibrationRepository(this)
         val calibration = calibrationRepository.loadOrDefault()
         detectionConfig = DetectionConfig.defaultInstance()
@@ -246,6 +243,9 @@ class MainActivity : AppCompatActivity() {
         detectionConfig.calibrationVersion = calibration.version
         detectionConfig.releaseState = currentReleaseState
         detectionConfig.modelVersion = currentModelVersion
+        sharedSync = FrameSynchronizer(enablePairing = false).apply {
+            setPairWindowNs(detectionConfig.dualPairWindowNs)
+        }
 
         // 初始化帧处理器（回调含 blob 信息供事件列表与导出）
         deepModelClassifier = if (detectionConfig.deepModelEnabled) {
