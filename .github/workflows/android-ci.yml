@@ -42,7 +42,22 @@ jobs:
       - name: Assemble, app lint and unit test
         run: ./gradlew assembleDebug :app:lintDebug testDebugUnitTest --no-daemon --stacktrace
 
+      - name: Detect eval inputs
+        id: detect_eval
+        shell: bash
+        run: |
+          set -euo pipefail
+          has_inputs="false"
+          baseline_count="$(find runs/baseline -type f -name summary.json 2>/dev/null | wc -l | tr -d '[:space:]')"
+          candidate_count="$(find runs/candidates -type f -name summary.json 2>/dev/null | wc -l | tr -d '[:space:]')"
+          if [[ -f "tools/scenario_template.json" ]] && [[ "${baseline_count:-0}" -gt 0 ]] && [[ "${candidate_count:-0}" -gt 0 ]]; then
+            has_inputs="true"
+          fi
+          echo "has_inputs=$has_inputs" >> "$GITHUB_OUTPUT"
+          echo "Eval inputs available: $has_inputs (baseline=$baseline_count, candidates=$candidate_count)"
+
       - name: Eval gate (if sample inputs exist)
+        if: steps.detect_eval.outputs.has_inputs == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -60,10 +75,14 @@ jobs:
             --strict \
             --report_out "$REPORT"
 
+      - name: Eval gate skipped
+        if: steps.detect_eval.outputs.has_inputs != 'true'
+        run: echo "Skip eval gate: runs inputs not found in repository."
+
       - name: Upload eval report artifact
-        if: always()
+        if: always() && steps.detect_eval.outputs.has_inputs == 'true'
         uses: actions/upload-artifact@v4.6.1
         with:
           name: eval-report
           path: tools/reports/report_ci.json
-          if-no-files-found: warn
+          if-no-files-found: error
