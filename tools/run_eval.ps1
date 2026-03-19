@@ -23,21 +23,25 @@ if ($candidateCount -le 0) {
     throw "no summary.json under candidates: $Candidates"
 }
 
-$args = @(
+$pipelineArgs = @(
     "tools/eval_pipeline.py",
     "--baseline", $Baseline,
     "--candidates_dir", $Candidates,
     "--scenario_template", $ScenarioTemplate,
+    "--strict",
     "--report_out", $ReportOut
 )
 
 if (Test-Path $Labels) {
-    $args += @("--labels", $Labels)
+    $pipelineArgs += @("--labels", $Labels)
 }
 
 Write-Host "Running eval pipeline..."
-Write-Host "python $($args -join ' ')"
-python @args
+Write-Host "python $($pipelineArgs -join ' ')"
+python @pipelineArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "eval_pipeline failed with exit code $LASTEXITCODE"
+}
 
 Write-Host ""
 Write-Host "Done. Report: $ReportOut"

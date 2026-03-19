@@ -38,6 +38,7 @@ import com.gammalens.app.camera.MeasurementReliability
 import com.gammalens.app.camera.OpenCvBootstrap
 import com.gammalens.app.camera.ProcessableItem
 import com.gammalens.app.camera.WhiteDotTfliteClassifier
+import com.gammalens.app.camera.releaseMatsSafely
 import com.gammalens.app.data.StatsRepository
 import com.gammalens.app.data.EventRepository
 import com.gammalens.app.data.DebugLogRepository
@@ -46,6 +47,7 @@ import com.gammalens.app.data.DeviceProfile
 import com.gammalens.app.data.DeviceCalibrationRepository
 import com.gammalens.app.data.EventItem
 import com.gammalens.app.data.RunSnapshotManager
+import com.gammalens.app.config.ReleaseVersionConfig
 import com.gammalens.app.ui.LiveFragment
 import com.gammalens.app.ui.EventsFragment
 import com.gammalens.app.ui.SpectrumFragment
@@ -185,8 +187,8 @@ class MainActivity : AppCompatActivity() {
     private var currentScenarioId = "dark_static"
     private var currentExperimentId = "prod"
     private var currentVariantId = "balanced"
-    private var currentReleaseState = "promoted"
-    private var currentModelVersion = "v8-r3-nomodel-prod"
+    private var currentReleaseState = ReleaseVersionConfig.DEFAULT_RELEASE_STATE
+    private var currentModelVersion = ReleaseVersionConfig.DEFAULT_MODEL_VERSION
     private var lastRollbackReason = "none"
     private var shadedPrecisionMode = true
     @Volatile private var currentDetectionMode: DetectionMode = DetectionMode.FUSION
@@ -231,7 +233,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        sharedSync = FrameSynchronizer(enablePairing = false)
+        sharedSync = FrameSynchronizer(enablePairing = false).apply {
+            setPairWindowNs(detectionConfig.dualPairWindowNs)
+        }
         calibrationRepository = DeviceCalibrationRepository(this)
         val calibration = calibrationRepository.loadOrDefault()
         detectionConfig = DetectionConfig.defaultInstance()
@@ -464,7 +468,9 @@ class MainActivity : AppCompatActivity() {
 
             val backPair = pickBackCameras(cameraManager)
             val isDual = backPair != null
-            sharedSync = FrameSynchronizer(enablePairing = isDual)
+            sharedSync = FrameSynchronizer(enablePairing = isDual).apply {
+                setPairWindowNs(detectionConfig.dualPairWindowNs)
+            }
             sharedSync.onSyncLog = { line -> debugLogRepository.pushGlSync(line) }
             sharedSync.reset()
 
@@ -478,20 +484,8 @@ class MainActivity : AppCompatActivity() {
 
                 // 统一的frame packet处理回调（串行到 FrameDispatch 线程）
                 val onFramePacketCallback: (FramePacket) -> Unit = { packet ->
-                    dispatchHandler?.post {
-                        if (!loggedFirstFrameStreams.contains(packet.streamId)) {
-                            loggedFirstFrameStreams.add(packet.streamId)
-                            val cameraId = if (packet.streamId == "cam0") cam0 else cam1
-                            Log.i("GL_DUAL", "IN_FIRST streamId=${packet.streamId} cameraId=$cameraId tsNs=${packet.timestampNs}")
-                        }
-                        val items = sharedSync.submit(packet)
-                        if (!primaryOnlyLogged) {
-                            primaryOnlyLogged = true
-                            Log.i("GL_DUAL", "PROCESS_PRIMARY_ONLY primary=$PRIMARY_STREAM_ID")
-                        }
-                        for (item in items) {
-                            if (item.anchor.streamId == PRIMARY_STREAM_ID) frameProcessor.consume(item)
-                        }
+                    dispatchFramePacket(packet) { streamId ->
+                        if (streamId == "cam0") cam0 else cam1
                     }
                 }
 
@@ -514,6 +508,7 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 Log.i("GL_DUAL", "PIPELINE_IDS cam0Id=$cam0 cam1Id=$cam1")
+                applyDisplayRotationToPipeline()
 
                 // 启动双摄（先 cam0 保证预览；延迟开 cam1 减轻 ERROR_CAMERA_IN_USE）
                 Log.i("GL_DUAL", "START_CALL cam0=$cam0 cam1=$cam1")
@@ -545,20 +540,7 @@ class MainActivity : AppCompatActivity() {
 
                 // 统一的frame packet处理回调（串行到 FrameDispatch 线程）
                 val onFramePacketCallback: (FramePacket) -> Unit = { packet ->
-                    dispatchHandler?.post {
-                        if (!loggedFirstFrameStreams.contains(packet.streamId)) {
-                            loggedFirstFrameStreams.add(packet.streamId)
-                            Log.i("GL_DUAL", "IN_FIRST streamId=${packet.streamId} cameraId=$singleCamId tsNs=${packet.timestampNs}")
-                        }
-                        val items = sharedSync.submit(packet)
-                        if (!primaryOnlyLogged) {
-                            primaryOnlyLogged = true
-                            Log.i("GL_DUAL", "PROCESS_PRIMARY_ONLY primary=$PRIMARY_STREAM_ID")
-                        }
-                        for (item in items) {
-                            if (item.anchor.streamId == PRIMARY_STREAM_ID) frameProcessor.consume(item)
-                        }
-                    }
+                    dispatchFramePacket(packet) { _ -> singleCamId }
                 }
 
                 pipeline0 = CameraPipeline(
@@ -568,6 +550,7 @@ class MainActivity : AppCompatActivity() {
                     textureView = textureView,
                     onFramePacket = onFramePacketCallback
                 )
+                applyDisplayRotationToPipeline()
 
                 // 启动单摄
                 requestedStart = true
@@ -587,7 +570,9 @@ class MainActivity : AppCompatActivity() {
             Log.e("GL_DUAL", "ERROR ${e.message}")
             setSystemStatus(getString(R.string.status_camera_dual_failed), level = STATUS_WARN, toast = true)
             // 退化为单摄重试
-            sharedSync = FrameSynchronizer(enablePairing = false)
+            sharedSync = FrameSynchronizer(enablePairing = false).apply {
+                setPairWindowNs(detectionConfig.dualPairWindowNs)
+            }
             sharedSync.reset()
             if (pipeline0 == null) {
                 try {
@@ -602,20 +587,7 @@ class MainActivity : AppCompatActivity() {
 
                     // 统一的frame packet处理回调（串行到 FrameDispatch 线程）
                     val onFramePacketCallback: (FramePacket) -> Unit = { packet ->
-                        dispatchHandler?.post {
-                            if (!loggedFirstFrameStreams.contains(packet.streamId)) {
-                                loggedFirstFrameStreams.add(packet.streamId)
-                                Log.i("GL_DUAL", "IN_FIRST streamId=${packet.streamId} cameraId=$fallbackCamId tsNs=${packet.timestampNs}")
-                            }
-                            val items = sharedSync.submit(packet)
-                            if (!primaryOnlyLogged) {
-                                primaryOnlyLogged = true
-                                Log.i("GL_DUAL", "PROCESS_PRIMARY_ONLY primary=$PRIMARY_STREAM_ID")
-                            }
-                            for (item in items) {
-                                if (item.anchor.streamId == PRIMARY_STREAM_ID) frameProcessor.consume(item)
-                            }
-                        }
+                        dispatchFramePacket(packet) { _ -> fallbackCamId }
                     }
 
                     pipeline0 = CameraPipeline(
@@ -625,6 +597,7 @@ class MainActivity : AppCompatActivity() {
                         textureView = textureView,
                         onFramePacket = onFramePacketCallback
                     )
+                    applyDisplayRotationToPipeline()
                     requestedStart = true
                     pipeline0?.start()
                     val mvpFallback = "PASS mode=single dualActive=false fallback=true captureSize=1280x720 fpsTarget=10"
@@ -671,14 +644,9 @@ class MainActivity : AppCompatActivity() {
      */
     private fun applyDisplayRotationToPipeline() {
         val rotationInt = readDisplayRotationInt()
-        val rotationDegrees = when (rotationInt) {
-            android.view.Surface.ROTATION_0 -> 0
-            android.view.Surface.ROTATION_90 -> 90
-            android.view.Surface.ROTATION_180 -> 180
-            android.view.Surface.ROTATION_270 -> 270
-            else -> 0
-        }
-        // 不再设置显示旋转，由pipeline内部处理
+        // 统一由 CameraPipeline 执行旋转计算；MainActivity 只同步当前 displayRotation。
+        pipeline0?.setDisplayRotation(rotationInt)
+        pipeline1?.setDisplayRotation(rotationInt)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -784,7 +752,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun pushStatsToRepository() {
         lastDeviceTempC = readBatteryTempC() ?: lastDeviceTempC
-        frameProcessor.updateDeviceTempC(lastDeviceTempC)
+        postFrameProcessorUpdate("updateDeviceTempC") {
+            frameProcessor.updateDeviceTempC(lastDeviceTempC)
+        }
         applyCurrentHotPixelMap()
         val currentTime = SystemClock.elapsedRealtime()
         val lastEventAgoSec = if (lastEventTimeMs > 0) {
@@ -894,7 +864,9 @@ class MainActivity : AppCompatActivity() {
         )
         lastTemperatureBucket = bucket
         lastHotPixelMapSize = points.size
-        frameProcessor.updateHotPixelMap(points, bucket)
+        postFrameProcessorUpdate("updateHotPixelMap") {
+            frameProcessor.updateHotPixelMap(points, bucket)
+        }
     }
 
     private fun updateLongWindowStats(nowMs: Long, significanceZ: Double) {
@@ -1216,12 +1188,12 @@ class MainActivity : AppCompatActivity() {
      * 停止相机预览
      */
     private fun stopCameraPreview() {
-        applyOnlineCalibrationIfNeeded()
-        runSnapshotManager?.endSession(debugLogRepository)
         pipeline0?.stop()
         pipeline1?.stop()
 
         stopDispatchThread()
+        applyOnlineCalibrationIfNeeded()
+        runSnapshotManager?.endSession(debugLogRepository)
 
         // 清理资源
         sharedSync.reset()
@@ -1295,6 +1267,95 @@ class MainActivity : AppCompatActivity() {
         Log.i("GL_DISPATCH", "thread=${thread.name} started")
     }
 
+    private fun postFrameProcessorUpdate(tag: String, action: () -> Unit) {
+        val handler = dispatchHandler
+        val thread = dispatchThread
+        if (handler == null || thread == null || !thread.isAlive) {
+            try {
+                action()
+            } catch (e: Exception) {
+                Log.w(TAG, "FrameProcessor update($tag) failed in direct mode: ${e.message}")
+            }
+            return
+        }
+        val posted = handler.post {
+            try {
+                action()
+            } catch (e: Exception) {
+                Log.w(TAG, "FrameProcessor update($tag) failed in dispatch thread: ${e.message}")
+            }
+        }
+        if (!posted) {
+            Log.w(TAG, "FrameProcessor update($tag) rejected by dispatch queue, fallback direct")
+            try {
+                action()
+            } catch (e: Exception) {
+                Log.w(TAG, "FrameProcessor update($tag) fallback failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun dispatchFramePacket(packet: FramePacket, cameraIdResolver: (String) -> String) {
+        val handler = dispatchHandler
+        if (handler == null) {
+            Log.w("GL_DUAL", "Dispatch handler unavailable, dropping streamId=${packet.streamId} frameNo=${packet.frameNumber}")
+            releaseFramePacketSafely(packet)
+            return
+        }
+        val posted = handler.post {
+            try {
+                if (!loggedFirstFrameStreams.contains(packet.streamId)) {
+                    loggedFirstFrameStreams.add(packet.streamId)
+                    val cameraId = cameraIdResolver(packet.streamId)
+                    Log.i("GL_DUAL", "IN_FIRST streamId=${packet.streamId} cameraId=$cameraId tsNs=${packet.timestampNs}")
+                }
+                val items = sharedSync.submit(packet)
+                if (!primaryOnlyLogged) {
+                    primaryOnlyLogged = true
+                    Log.i("GL_DUAL", "PROCESS_PRIMARY_ONLY primary=$PRIMARY_STREAM_ID")
+                }
+                for (item in items) {
+                    if (item.anchor.streamId == PRIMARY_STREAM_ID) {
+                        consumeItemSafely(item)
+                    } else {
+                        item.releaseMatsSafely()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(
+                    TAG,
+                    "Dispatch submit failed streamId=${packet.streamId} frameNo=${packet.frameNumber} tsNs=${packet.timestampNs}",
+                    e
+                )
+                releaseFramePacketSafely(packet)
+            }
+        }
+        if (!posted) {
+            Log.w("GL_DUAL", "Dispatch queue rejected packet streamId=${packet.streamId} frameNo=${packet.frameNumber}")
+            releaseFramePacketSafely(packet)
+        }
+    }
+
+    private fun releaseFramePacketSafely(packet: FramePacket) {
+        try {
+            packet.grayMat.release()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun consumeItemSafely(item: ProcessableItem) {
+        try {
+            frameProcessor.consume(item)
+        } catch (e: Exception) {
+            val anchor = item.anchor
+            Log.e(
+                TAG,
+                "Dispatch consume failed streamId=${anchor.streamId} frameNo=${anchor.frameNumber} tsNs=${anchor.timestampNs}",
+                e
+            )
+        }
+    }
+
     private fun stopDispatchThread() {
         val t = dispatchThread ?: return
         if (!t.isAlive) {
@@ -1303,6 +1364,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
         t.quitSafely()
+        try {
+            t.join(2_500L)
+        } catch (e: InterruptedException) {
+            Log.w("GL_DISPATCH", "join interrupted: ${e.message}")
+            Thread.currentThread().interrupt()
+        }
         dispatchThread = null
         dispatchHandler = null
         Log.i("GL_DISPATCH", "stopped")

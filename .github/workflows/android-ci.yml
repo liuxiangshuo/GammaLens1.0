@@ -1,0 +1,69 @@
+name: Android CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Grant execute permission for Gradle
+        run: chmod +x gradlew
+
+      - name: Assemble, app lint and unit test
+        run: ./gradlew assembleDebug :app:lintDebug testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Eval gate (if sample inputs exist)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE="runs/baseline"
+          CANDIDATES="runs/candidates"
+          TEMPLATE="tools/scenario_template.json"
+          REPORT="tools/reports/report_ci.json"
+          test -d "$BASELINE"
+          test -d "$CANDIDATES"
+          test -f "$TEMPLATE"
+          python tools/eval_pipeline.py \
+            --baseline "$BASELINE" \
+            --candidates_dir "$CANDIDATES" \
+            --scenario_template "$TEMPLATE" \
+            --strict \
+            --report_out "$REPORT"
+
+      - name: Upload eval report artifact
+        if: always()
+        uses: actions/upload-artifact@v4.6.1
+        with:
+          name: eval-report
+          path: tools/reports/report_ci.json
+          if-no-files-found: warn

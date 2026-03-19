@@ -124,6 +124,8 @@ class FrameProcessor(
     private val deepModelInference: ((Mat) -> Double?)? = null,
 ) {
     @Volatile private var config: DetectionConfig = initialConfig.deepCopy()
+    @Volatile private var frameConfigSnapshot: DetectionConfig? = null
+    @Volatile private var roiWeightsDirty: Boolean = true
 
     /** Called every ~1s with FPS/耗时/检测统计。 */
     var onStatsSnapshot: ((FrameStatsSnapshot) -> Unit)? = null
@@ -299,7 +301,16 @@ class FrameProcessor(
 
     @Synchronized
     fun updateConfig(newConfig: DetectionConfig) {
-        config = newConfig.deepCopy()
+        val prev = config
+        val next = newConfig.deepCopy()
+        val roiChanged = prev.roiWeightEnabled != next.roiWeightEnabled ||
+            prev.roiCenterWeight != next.roiCenterWeight ||
+            prev.roiEdgeWeight != next.roiEdgeWeight ||
+            prev.roiTransitionRatio != next.roiTransitionRatio
+        config = next
+        if (roiChanged) {
+            roiWeightsDirty = true
+        }
     }
 
     fun updateDeviceTempC(tempC: Double?) {
@@ -385,9 +396,14 @@ class FrameProcessor(
             roiWeightMat = Mat(h, w, CvType.CV_32F)
             stackAccumulator = Mat(h, w, CvType.CV_32F, Scalar(0.0))
             generateRoiWeightMap(w, h)
+            roiWeightsDirty = false
 
             cachedW = w
             cachedH = h
+        }
+        if (::roiWeightMat.isInitialized && roiWeightsDirty) {
+            generateRoiWeightMap(w, h)
+            roiWeightsDirty = false
         }
 
         // 延迟初始化kernel（只创建一次）
@@ -397,6 +413,7 @@ class FrameProcessor(
     }
 
     private fun generateRoiWeightMap(w: Int, h: Int) {
+        val config = activeConfig()
         val cx = w / 2.0
         val cy = h / 2.0
         val hw = w / 2.0
@@ -458,11 +475,15 @@ class FrameProcessor(
         val startNs = System.nanoTime()
         val frame = item.anchor
         val nowMs = SystemClock.elapsedRealtime()
+        val cfg = config
+        val config = cfg
+        frameConfigSnapshot = cfg
+        var phase = "init"
         if (warmupStartMs < 0L) warmupStartMs = nowMs
-        warmupActive = nowMs - warmupStartMs < config.warmupMs
+        warmupActive = nowMs - warmupStartMs < cfg.warmupMs
         updateBucketAdaptiveThresholds()
-        val startupWindowMs = config.startupWindowSec.coerceAtLeast(0) * 1000L
-        tempCompPhase = if (config.startupTempCompEnabled && nowMs - warmupStartMs < startupWindowMs) "startup" else "steady"
+        val startupWindowMs = cfg.startupWindowSec.coerceAtLeast(0) * 1000L
+        tempCompPhase = if (cfg.startupTempCompEnabled && nowMs - warmupStartMs < startupWindowMs) "startup" else "steady"
         val suppressionSignal = item.other?.let { other ->
             try {
                 buildDualSuppressionSignal(frame.grayMat, other.grayMat, frame.timestampNs, other.timestampNs)
@@ -473,9 +494,10 @@ class FrameProcessor(
         lastPairPenalty = suppressionSignal.pairPenalty
 
         try {
+            phase = "preprocess"
             // 延迟初始化背景建模器
             if (backgroundSubtractor == null) {
-                backgroundSubtractor = Video.createBackgroundSubtractorMOG2(config.mog2History, config.mog2VarThreshold, false)
+                backgroundSubtractor = Video.createBackgroundSubtractorMOG2(cfg.mog2History, cfg.mog2VarThreshold, false)
             }
 
             // 缓存最后一个FramePacket用于日志
@@ -583,6 +605,7 @@ class FrameProcessor(
                 if (cooldownRemainingSeconds > 0) {
                     cooldownRemainingSeconds--
                 } else {
+                    phase = "gate"
                     // 跳过无效帧的评分和触发逻辑
                     val isValidFrame = lastEffectiveNonZeroCount > 0
 
@@ -646,7 +669,7 @@ class FrameProcessor(
                         )
 
                         // 更新EMA
-                        scoreEma = config.emaAlpha * score + (1.0 - config.emaAlpha) * scoreEma
+                        scoreEma = cfg.emaAlpha * score + (1.0 - cfg.emaAlpha) * scoreEma
 
                         if (warmupActive) {
                             confirmWindow.clear()
@@ -658,7 +681,7 @@ class FrameProcessor(
                             funnelCandidateCount++
                             streakSeconds++
                             confirmWindow.addLast(currentTimeMs to scoreEma)
-                            while (confirmWindow.isNotEmpty() && currentTimeMs - confirmWindow.first.first > config.confirmWindowSeconds * 1000L) {
+                            while (confirmWindow.isNotEmpty() && currentTimeMs - confirmWindow.first.first > cfg.confirmWindowSeconds * 1000L) {
                                 confirmWindow.removeFirst()
                             }
                             val hits = confirmWindow.size
@@ -719,7 +742,7 @@ class FrameProcessor(
                                 weightStability = config.riskWeightStability,
                                 weightQuality = config.riskWeightQuality,
                             )
-                            val riskAlpha = config.riskScoreEmaAlpha.coerceIn(0.05, 1.0)
+                            val riskAlpha = cfg.riskScoreEmaAlpha.coerceIn(0.05, 1.0)
                             riskScore = if (warmupActive || riskScore <= 0.0) {
                                 riskScoreComputed
                             } else {
@@ -727,8 +750,8 @@ class FrameProcessor(
                             }
                             riskScore = FrameProcessorAlgorithms.applyRiskCalibration(
                                 score = riskScore,
-                                enabled = config.riskCalibrationEnabled,
-                                points = config.riskCalibrationPoints,
+                                enabled = cfg.riskCalibrationEnabled,
+                                points = cfg.riskCalibrationPoints,
                             )
                             val nextRiskTriggerState = if (config.riskScoreEnabled) {
                                 FrameProcessorAlgorithms.applyHysteresis(
@@ -776,11 +799,11 @@ class FrameProcessor(
                                 eventCount++
                                 lastEventTimeMs = currentTimeMs
                                 eventListener?.onRadiationEvent(score, lastBlobCount, lastMaxArea.toFloat())
-                                onRadiationCandidate?.invoke(frame.streamId, scoreEma, frame.timestampNs, config.cooldownSeconds, lastBlobCount, lastMaxArea, lastEffectiveNonZeroCount)
+                                onRadiationCandidate?.invoke(frame.streamId, scoreEma, frame.timestampNs, cfg.cooldownSeconds, lastBlobCount, lastMaxArea, lastEffectiveNonZeroCount)
                                 val evtLine = "streamId=${frame.streamId}, type=RADIATION_CANDIDATE, blobCount=$lastBlobCount, maxArea=${String.format("%.1f", lastMaxArea)}, nonZeroCount=$lastEffectiveNonZeroCount, streakSeconds=$streakSeconds, score=$score, scoreEma=${String.format("%.1f", scoreEma)}, confirmScore=${String.format("%.1f", confirmScore)}, clsProb=${String.format("%.2f", classifierProbability)}, cooldownSeconds=${config.cooldownSeconds}"
                                 Log.i("GL_EVT", evtLine)
                                 onEvtLog?.invoke(evtLine)
-                                cooldownRemainingSeconds = config.cooldownSeconds
+                                cooldownRemainingSeconds = cfg.cooldownSeconds
                                 streakSeconds = 0
                                 confirmWindow.clear()
                                 if (config.cusumResetOnSuppression) {
@@ -831,6 +854,7 @@ class FrameProcessor(
                 processMsWindowFrames = 0
             }
 
+            phase = "vision"
             // 应用旋转以获得正确方向的图像
             val alignedMat = applyRotationIfNeeded(frame)
 
@@ -1054,12 +1078,19 @@ class FrameProcessor(
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error processing frame", e)
+            Log.e(
+                TAG,
+                "Error processing frame streamId=${frame.streamId} frameNo=${frame.frameNumber} tsNs=${frame.timestampNs} phase=$phase mode=${detectionMode.name}",
+                e
+            )
         } finally {
+            frameConfigSnapshot = null
             // 释放Mat避免native内存泄漏
             frame.grayMat.release()
         }
     }
+
+    private fun activeConfig(): DetectionConfig = frameConfigSnapshot ?: config
 
     /**
      * 根据rotationDegrees应用旋转，返回正确方向的Mat
@@ -1099,6 +1130,7 @@ class FrameProcessor(
     }
 
     private fun computeAdaptiveDiffThreshold(diffNoiseMean: Double, alignedMat: Mat, pairPenalty: Double): Double {
+        val config = activeConfig()
         diffNoiseWindow.addLast(diffNoiseMean)
         while (diffNoiseWindow.size > config.adaptiveWindowSize) {
             diffNoiseWindow.removeFirst()
@@ -1131,6 +1163,7 @@ class FrameProcessor(
     }
 
     private fun updateBranchStability(mog2NonZero: Int, diffNonZero: Int) {
+        val config = activeConfig()
         mog2StrongStreak = if (mog2NonZero >= config.branchStrongNonZero) {
             (mog2StrongStreak + 1).coerceAtMost(MAX_STREAK_CAP)
         } else {
@@ -1144,6 +1177,7 @@ class FrameProcessor(
     }
 
     private fun updateHotPixelSuppression(mask: Mat) {
+        val config = activeConfig()
         val mask32 = Mat()
         try {
             mask.convertTo(mask32, CvType.CV_32F, 1.0 / 255.0)
@@ -1217,6 +1251,7 @@ class FrameProcessor(
     }
 
     private fun updateCusum(evidence: Double, reset: Boolean, unstable: Boolean) {
+        val config = activeConfig()
         if (!config.cusumEnabled) {
             cusumPositive = 0.0
             cusumNegative = 0.0
@@ -1240,6 +1275,7 @@ class FrameProcessor(
     }
 
     private fun updateFeatureLite(nonZero: Int) {
+        val config = activeConfig()
         val pulseActive = nonZero >= config.pulseActiveNonZeroThreshold
         if (pulseActive) {
             currentPulseRun = (currentPulseRun + 1).coerceAtMost(300)
@@ -1274,6 +1310,7 @@ class FrameProcessor(
     }
 
     private fun computeStackAdaptiveParams(): StackAdaptiveParams {
+        val config = activeConfig()
         val result = FrameProcessorAlgorithms.computeStackAdaptive(
             depthBase = config.frameStackDepth,
             thresholdBase = config.frameStackThreshold,
@@ -1293,6 +1330,7 @@ class FrameProcessor(
     }
 
     private fun applyRoiWeightToBinaryMask(mask: Mat): Int {
+        val config = activeConfig()
         if (!config.roiWeightEnabled || !::roiWeightMat.isInitialized) return 0
         val beforeCount = Core.countNonZero(mask)
         val maskFloat = Mat()
@@ -1315,6 +1353,7 @@ class FrameProcessor(
     }
 
     private fun updateBucketAdaptiveThresholds() {
+        val config = activeConfig()
         if (!config.bucketAdaptationEnabled) {
             adaptedRiskTriggerHigh = config.riskScoreTriggerHigh
             adaptedRiskReleaseLow = config.riskScoreReleaseLow
@@ -1348,6 +1387,7 @@ class FrameProcessor(
     }
 
     private fun updatePoissonConsistency(nonZero: Int, nowMs: Long) {
+        val config = activeConfig()
         if (!config.poissonCheckEnabled) {
             poissonCv = 0.0
             poissonRawCv = 0.0
@@ -1448,6 +1488,7 @@ class FrameProcessor(
     }
 
     private fun updateDeepModelProbability(frame: Mat) {
+        val config = activeConfig()
         if (!config.deepModelEnabled) {
             deepModelProbability = 0.0
             return
@@ -1457,6 +1498,7 @@ class FrameProcessor(
     }
 
     private fun updateMeasurementCondition(frame: Mat, dx: Double, dy: Double) {
+        val config = activeConfig()
         val mean = MatOfDouble()
         val std = MatOfDouble()
         val satMask = Mat()
@@ -1494,6 +1536,7 @@ class FrameProcessor(
     }
 
     private fun applyMotionCompensation(current: Mat, previous: Mat): MotionCompResult {
+        val config = activeConfig()
         val prevSmall = Mat()
         val currSmall = Mat()
         val prev32 = Mat()
@@ -1579,6 +1622,7 @@ class FrameProcessor(
     }
 
     private fun buildDualSuppressionSignal(anchor: Mat, other: Mat, anchorTsNs: Long, otherTsNs: Long): DualSuppressionSignal {
+        val config = activeConfig()
         val globalFlash = Core.mean(other).`val`[0] > config.luminanceFlashThreshold
         val deltaNs = kotlin.math.abs(anchorTsNs - otherTsNs)
         val pairPenalty = (deltaNs.toDouble() / config.dualPairWindowNs.toDouble()).coerceIn(0.0, 1.0)

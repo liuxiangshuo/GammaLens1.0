@@ -58,6 +58,7 @@ class CameraPipeline(
     private var cameraCaptureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
     private var previewSurface: android.view.Surface? = null
+    private var previewSurfaceOwnedByPipeline: Boolean = false
     private var previewSize: Size? = null
     private var frameNumber: Long = 0
     private var displayRotation: Int = android.view.Surface.ROTATION_0
@@ -92,6 +93,7 @@ class CameraPipeline(
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private val cameraOpenCloseLock = Semaphore(1)
+    @Volatile private var openLockHeld = false
 
     // 相机状态回调
     private val stateCallback = object : CameraDevice.StateCallback() {
@@ -99,12 +101,12 @@ class CameraPipeline(
             if (!running || closing) {
                 Log.w(TAG, "Ignored stale onOpened callback (running=$running, closing=$closing)")
                 camera.close()
-                cameraOpenCloseLock.release()
+                releaseOpenCloseLockIfHeld()
                 return
             }
 
             Log.i("GL_PIPE", "$streamId OPENED cameraId=${camera.id}")
-            cameraOpenCloseLock.release()
+            releaseOpenCloseLockIfHeld()
             cameraDevice = camera
             createCameraPreviewSession()
         }
@@ -112,14 +114,14 @@ class CameraPipeline(
         override fun onDisconnected(camera: CameraDevice) {
             Log.d(TAG, "Camera disconnected: ${camera.id}")
             Log.w("GL_PIPE", "$streamId DISCONNECTED cameraId=${camera.id}")
-            cameraOpenCloseLock.release()
+            releaseOpenCloseLockIfHeld()
             closeCamera()
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
             Log.e(TAG, "Camera error: ${camera.id}, error: $error")
             Log.e("GL_PIPE", "$streamId ERROR cameraId=${camera.id} code=$error")
-            cameraOpenCloseLock.release()
+            releaseOpenCloseLockIfHeld()
             closeCamera()
         }
     }
@@ -163,11 +165,12 @@ class CameraPipeline(
             } else {
                 // 非连续内存，需要逐行处理
                 val yBytes = ByteArray(width * height)
+                val bufferLimit = yBuffer.limit()
                 for (row in 0 until height) {
                     val rowStart = row * yRowStride
                     for (col in 0 until width) {
                         val pixelIndex = rowStart + col * yPixelStride
-                        if (pixelIndex < yBytes.size) {
+                        if (pixelIndex >= 0 && pixelIndex < bufferLimit) {
                             yBytes[row * width + col] = yBuffer.get(pixelIndex)
                         }
                     }
@@ -316,62 +319,59 @@ class CameraPipeline(
         cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
         try {
-            // 选择后置相机
-            for (id in cameraManager!!.cameraIdList) {
-                val characteristics = cameraManager!!.getCameraCharacteristics(id)
-                val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
-
-                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
-                    // 选择合适的尺寸
-                    val chosenSize = chooseConservativeSize(characteristics)
-                    previewSize = chosenSize
-
-                    // 计算旋转角度并打印日志
-                    this.sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-                    val sensorOrientation = this.sensorOrientation!!
-
-                    // 如果之前有缓存的displayRotation，现在重新计算并更新currentRotationDegrees
-                    if (lastAppliedDisplayRotation != android.view.Surface.ROTATION_0 || currentDisplayRotation != android.view.Surface.ROTATION_0) {
-                        val cachedDisplayRotation = if (lastAppliedDisplayRotation != android.view.Surface.ROTATION_0) lastAppliedDisplayRotation else currentDisplayRotation
-                        val displayRotationDegrees = when (cachedDisplayRotation) {
-                            android.view.Surface.ROTATION_0 -> 0
-                            android.view.Surface.ROTATION_90 -> 90
-                            android.view.Surface.ROTATION_180 -> 180
-                            android.view.Surface.ROTATION_270 -> 270
-                            else -> 0
-                        }
-                        val initialRotationDegrees = (sensorOrientation - displayRotationDegrees + 360) % 360
-                        this.currentRotationDegrees = initialRotationDegrees
-                        this.currentIsMirrored = false
-                        Log.i("GL_ROT_CHG", "cameraId=$cameraId, sensorOrientation=$sensorOrientation, displayRotation=$cachedDisplayRotation, displayRotationDegrees=$displayRotationDegrees, rotationDegrees=$initialRotationDegrees, isMirrored=false")
-                    }
-                    val displayRotationDegrees = when (currentDisplayRotation) {
-                        android.view.Surface.ROTATION_0 -> 0
-                        android.view.Surface.ROTATION_90 -> 90
-                        android.view.Surface.ROTATION_180 -> 180
-                        android.view.Surface.ROTATION_270 -> 270
-                        else -> 0
-                    }
-                    this.rotationDegrees = (sensorOrientation - displayRotationDegrees + 360) % 360
-                    this.isMirrored = false // 后摄不支持镜像
-                    this.currentRotationDegrees = this.rotationDegrees
-                    this.currentIsMirrored = this.isMirrored
-                    this.lastAppliedRotationDegrees = this.rotationDegrees
-
-                    Log.i("GL_ROT", "cameraId=$cameraId, sensorOrientation=$sensorOrientation, displayRotation=$currentDisplayRotation, displayRotationDegrees=$displayRotationDegrees, rotationDegrees=${this.rotationDegrees}, isMirrored=${this.isMirrored}")
-
-                    // 创建ImageReader (YUV_420_888, maxImages=2)
-                    imageReader = ImageReader.newInstance(
-                        chosenSize.width, chosenSize.height,
-                        ImageFormat.YUV_420_888, 2
-                    )
-                    imageReader?.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
-
-                    break
-                }
+            val manager = cameraManager ?: throw IllegalStateException("cameraManager is null")
+            val characteristics = manager.getCameraCharacteristics(cameraId)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing != CameraCharacteristics.LENS_FACING_BACK) {
+                Log.w(TAG, "Configured cameraId=$cameraId is not back camera, facing=$facing")
             }
+
+            // 只使用传入 cameraId 的特征，避免参数和实际打开设备不一致
+            val chosenSize = chooseConservativeSize(characteristics)
+            previewSize = chosenSize
+
+            // 计算旋转角度并打印日志
+            this.sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val sensorOrientation = this.sensorOrientation!!
+
+            // 如果之前有缓存的displayRotation，现在重新计算并更新currentRotationDegrees
+            if (lastAppliedDisplayRotation != android.view.Surface.ROTATION_0 || currentDisplayRotation != android.view.Surface.ROTATION_0) {
+                val cachedDisplayRotation = if (lastAppliedDisplayRotation != android.view.Surface.ROTATION_0) lastAppliedDisplayRotation else currentDisplayRotation
+                val displayRotationDegrees = when (cachedDisplayRotation) {
+                    android.view.Surface.ROTATION_0 -> 0
+                    android.view.Surface.ROTATION_90 -> 90
+                    android.view.Surface.ROTATION_180 -> 180
+                    android.view.Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+                val initialRotationDegrees = (sensorOrientation - displayRotationDegrees + 360) % 360
+                this.currentRotationDegrees = initialRotationDegrees
+                this.currentIsMirrored = false
+                Log.i("GL_ROT_CHG", "cameraId=$cameraId, sensorOrientation=$sensorOrientation, displayRotation=$cachedDisplayRotation, displayRotationDegrees=$displayRotationDegrees, rotationDegrees=$initialRotationDegrees, isMirrored=false")
+            }
+            val displayRotationDegrees = when (currentDisplayRotation) {
+                android.view.Surface.ROTATION_0 -> 0
+                android.view.Surface.ROTATION_90 -> 90
+                android.view.Surface.ROTATION_180 -> 180
+                android.view.Surface.ROTATION_270 -> 270
+                else -> 0
+            }
+            this.rotationDegrees = (sensorOrientation - displayRotationDegrees + 360) % 360
+            this.isMirrored = false
+            this.currentRotationDegrees = this.rotationDegrees
+            this.currentIsMirrored = this.isMirrored
+            this.lastAppliedRotationDegrees = this.rotationDegrees
+
+            Log.i("GL_ROT", "cameraId=$cameraId, sensorOrientation=$sensorOrientation, displayRotation=$currentDisplayRotation, displayRotationDegrees=$displayRotationDegrees, rotationDegrees=${this.rotationDegrees}, isMirrored=${this.isMirrored}")
+
+            imageReader = ImageReader.newInstance(
+                chosenSize.width, chosenSize.height,
+                ImageFormat.YUV_420_888, 2
+            )
+            imageReader?.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
         } catch (e: Exception) {
-            Log.e(TAG, "Error setting up camera", e)
+            Log.e(TAG, "Error setting up cameraId=$cameraId", e)
+            throw e
         }
     }
 
@@ -379,6 +379,7 @@ class CameraPipeline(
      * 打开相机
      */
     private fun openCamera() {
+        var acquired = false
         try {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
                 Log.e(TAG, "Camera permission not granted, skip openCamera")
@@ -388,11 +389,15 @@ class CameraPipeline(
             if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
                 throw RuntimeException("Time out waiting to lock camera opening.")
             }
+            acquired = true
+            openLockHeld = true
             cameraManager?.openCamera(cameraId, stateCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Error opening camera", e)
             Log.e("GL_PIPE", "$streamId FAIL stage=open cameraId=${cameraId} err=${e.message}")
-            cameraOpenCloseLock.release()
+            if (acquired) {
+                releaseOpenCloseLockIfHeld()
+            }
         }
     }
 
@@ -407,9 +412,12 @@ class CameraPipeline(
                 return
             }
 
-            // 释放旧的预览Surface（防止重启时泄漏）
-            previewSurface?.release()
+            // 释放旧的预览Surface（仅释放由当前pipeline创建的对象）
+            if (previewSurfaceOwnedByPipeline) {
+                previewSurface?.release()
+            }
             previewSurface = null
+            previewSurfaceOwnedByPipeline = false
 
             // 空值保护
             val cameraDevice = cameraDevice ?: run {
@@ -445,6 +453,7 @@ class CameraPipeline(
                     // 使用外部提供的离屏Surface
                     Log.i("GL_SURF", "using offscreen surface for streamId=$streamId")
                     previewSurface = previewSurfaceOverride
+                    previewSurfaceOwnedByPipeline = false
                 } else {
                     // 使用TextureView的Surface
                     if (!textureView.isAvailable) {
@@ -460,6 +469,7 @@ class CameraPipeline(
                     Log.i("GL_SURF", "creating session with SurfaceTexture hash=${texture.hashCode()}")
                     texture.setDefaultBufferSize(chosenSize.width, chosenSize.height)
                     previewSurface = Surface(texture)
+                    previewSurfaceOwnedByPipeline = true
                 }
                 previewSurface?.let { surfaces.add(it) }
             }
@@ -468,8 +478,8 @@ class CameraPipeline(
             surfaces.forEach { captureRequestBuilder.addTarget(it) }
 
             // 应用手动控制设置
-            val characteristics = cameraManager?.getCameraCharacteristics(cameraId!!)
-            if (characteristics != null && captureRequestBuilder != null) {
+            val characteristics = cameraManager?.getCameraCharacteristics(cameraId)
+            if (characteristics != null) {
                 val controlResult = applyManualControls(captureRequestBuilder, characteristics)
                 logManualControlResult(controlResult)
             }
@@ -520,8 +530,10 @@ class CameraPipeline(
      * 关闭相机
      */
     private fun closeCamera() {
+        var acquired = false
         try {
             cameraOpenCloseLock.acquire()
+            acquired = true
 
             // 安全停止重复请求 - 特别处理CAMERA_ERROR(3)
             cameraCaptureSession?.let { session ->
@@ -557,11 +569,14 @@ class CameraPipeline(
 
             // 释放预览Surface
             try {
-                previewSurface?.release()
+                if (previewSurfaceOwnedByPipeline) {
+                    previewSurface?.release()
+                }
             } catch (e: Exception) {
                 Log.w("GL_SURF", "Failed to release preview surface: ${e.message}")
             }
             previewSurface = null
+            previewSurfaceOwnedByPipeline = false
 
             // 注意：不要释放SurfaceTexture本身（textureView.surfaceTexture），让系统管理
             Log.d(TAG, "Camera cleanup completed")
@@ -574,6 +589,15 @@ class CameraPipeline(
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted while closing camera", e)
         } finally {
+            if (acquired) {
+                cameraOpenCloseLock.release()
+            }
+        }
+    }
+
+    private fun releaseOpenCloseLockIfHeld() {
+        if (openLockHeld) {
+            openLockHeld = false
             cameraOpenCloseLock.release()
         }
     }

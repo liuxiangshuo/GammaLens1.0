@@ -1,5 +1,7 @@
 package com.gammalens.app.camera
 
+import com.gammalens.app.config.ReleaseVersionConfig
+
 /**
  * Centralized detection parameters for easier tuning and exports.
  */
@@ -161,8 +163,8 @@ class DetectionConfig {
     var deepModelInputSize: Int = 64
     var deepModelWeight: Double = 0.30
     var deepModelThreshold: Double = 0.52
-    var releaseState: String = "baseline"
-    var modelVersion: String = "v8-r5-nomodel-prod"
+    var releaseState: String = ReleaseVersionConfig.DEFAULT_RELEASE_STATE
+    var modelVersion: String = ReleaseVersionConfig.DEFAULT_MODEL_VERSION
     var calibrationVersion: Int = 1
 
     fun deepCopy(): DetectionConfig {

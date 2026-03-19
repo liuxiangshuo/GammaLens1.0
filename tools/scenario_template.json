@@ -33,7 +33,11 @@
   "targets": {
     "false_positive_drop": ">=12%",
     "recall_improvement": ">=2%",
-    "process_ms_budget": "<=+8%"
+    "process_ms_budget": "<=+8%",
+    "scenario_min_samples": 1,
+    "allow_baseline_fallback": false,
+    "strict_mode": true,
+    "pairing_coverage_min": 1.0
   },
   "batch_eval": {
     "experimentId": "prod",

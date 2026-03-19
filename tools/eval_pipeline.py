@@ -6,6 +6,7 @@ GammaLens one-shot evaluation pipeline with hard-gate, CI and diagnostics.
 import argparse
 import csv
 import json
+import math
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -30,9 +31,28 @@ def extract(summary: dict) -> Dict[str, float]:
     }
 
 
+def collect_invalid_numeric_fields(metrics: Dict[str, float]) -> List[str]:
+    invalid: List[str] = []
+    for key in ("poorRatio", "meanRate60s", "processMsAvg"):
+        value = metrics.get(key)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            invalid.append(key)
+    poor_ratio = metrics.get("poorRatio")
+    if isinstance(poor_ratio, (int, float)) and math.isfinite(float(poor_ratio)):
+        if not (0.0 <= float(poor_ratio) <= 1.0):
+            invalid.append("poorRatio(range)")
+    process_ms = metrics.get("processMsAvg")
+    if isinstance(process_ms, (int, float)) and math.isfinite(float(process_ms)):
+        if float(process_ms) <= 0.0:
+            invalid.append("processMsAvg(<=0)")
+    mean_rate = metrics.get("meanRate60s")
+    if isinstance(mean_rate, (int, float)) and math.isfinite(float(mean_rate)):
+        if float(mean_rate) < 0.0:
+            invalid.append("meanRate60s(<0)")
+    return invalid
+
+
 def pct_change(new: float, old: float) -> float:
-    if old == 0:
-        return 0.0
     return (new - old) / old * 100.0
 
 
@@ -84,20 +104,25 @@ def discover_baselines(baseline_path: Path) -> List[Dict[str, float]]:
     return []
 
 
-def choose_baseline(cand: Dict[str, float], baseline_pool: List[Dict[str, float]]) -> Optional[Dict[str, float]]:
+def choose_baseline(
+    cand: Dict[str, float],
+    baseline_pool: List[Dict[str, float]],
+    allow_fallback: bool,
+) -> Optional[Dict[str, float]]:
     if not baseline_pool:
         return None
     # Priority 1: exact scenario+temp bucket.
     for b in baseline_pool:
         if b.get("scenarioId") == cand.get("scenarioId") and b.get("tempBucket") == cand.get("tempBucket"):
             return b
-    # Priority 2: same scenario.
-    for b in baseline_pool:
-        if b.get("scenarioId") == cand.get("scenarioId"):
-            return b
-    # Priority 3: fallback only when there is a single baseline.
-    if len(baseline_pool) == 1:
-        return baseline_pool[0]
+    if allow_fallback:
+        # Priority 2: same scenario.
+        for b in baseline_pool:
+            if b.get("scenarioId") == cand.get("scenarioId"):
+                return b
+        # Priority 3: fallback only when there is a single baseline.
+        if len(baseline_pool) == 1:
+            return baseline_pool[0]
     return None
 
 
@@ -284,6 +309,8 @@ def evaluate_gate(
     has_labels: bool,
     pairing_coverage: float,
     config_failures: List[str],
+    template_coverage_failures: List[str],
+    label_required: bool,
 ) -> Tuple[bool, List[str]]:
     failures: List[str] = []
     fp_target = parse_target_percent(str(targets.get("false_positive_drop", ">=12%")))
@@ -300,6 +327,9 @@ def evaluate_gate(
     if pairing_coverage < pairing_min:
         failures.append(f"pairing coverage {pairing_coverage:.3f} < {pairing_min:.3f}")
     failures.extend(config_failures)
+    failures.extend(template_coverage_failures)
+    if label_required and not has_labels:
+        failures.append("labels are required by targets.label_required but labels file is missing")
     if label_gate:
         p_min = float(targets.get("label_precision_min", 0.55))
         r_min = float(targets.get("label_recall_min", 0.45))
@@ -380,9 +410,27 @@ def main() -> None:
     baseline_pool = discover_baselines(baseline_path)
     if not baseline_pool:
         raise SystemExit(f"no baseline summary found: {baseline_path}")
+    invalid_baselines = [
+        idx for idx, b in enumerate(baseline_pool)
+        if collect_invalid_numeric_fields(b)
+    ]
+    if invalid_baselines:
+        raise SystemExit(f"baseline has invalid numeric fields at indices: {invalid_baselines}")
     scenario_template = load_json(scenario_template_path)
+    required_scenarios = [
+        str(item.get("id", "")).strip()
+        for item in scenario_template.get("scenarios", [])
+        if str(item.get("id", "")).strip()
+    ]
     targets = scenario_template.get("targets", {})
     strict_mode = args.strict or parse_bool(targets.get("strict_mode"), default=False)
+    allow_baseline_fallback = parse_bool(targets.get("allow_baseline_fallback"), default=False)
+    label_required = parse_bool(targets.get("label_required"), default=False)
+    if strict_mode and not required_scenarios:
+        raise SystemExit("strict mode requires non-empty scenarios in scenario_template")
+    scenario_min_samples = int(targets.get("scenario_min_samples", 1))
+    if strict_mode and scenario_min_samples < 1:
+        raise SystemExit("strict mode requires scenario_min_samples >= 1")
 
     candidate_paths = discover_candidates(candidates_dir)
     if not candidate_paths:
@@ -408,13 +456,28 @@ def main() -> None:
             if missing:
                 strict_failures.append(f"{candidate_path.parent.name}: missing required fields: {missing}")
         cand = extract(raw_summary)
-        baseline = choose_baseline(cand, baseline_pool)
+        invalid_numeric = collect_invalid_numeric_fields(cand)
+        if invalid_numeric:
+            strict_failures.append(
+                f"{candidate_path.parent.name}: invalid numeric fields: {invalid_numeric}"
+            )
+            continue
+        baseline = choose_baseline(cand, baseline_pool, allow_fallback=allow_baseline_fallback)
         if baseline is None:
             pairing_failures.append(
                 f"{candidate_path.parent.name}: no baseline match for scenario={cand['scenarioId']} tempBucket={cand['tempBucket']}"
             )
             continue
         run_id = candidate_path.parent.name
+        if baseline["meanRate60s"] <= 0.0:
+            strict_failures.append(f"{run_id}: baseline meanRate60s must be > 0 for pct_change")
+            continue
+        if baseline["processMsAvg"] <= 0.0:
+            strict_failures.append(f"{run_id}: baseline processMsAvg must be > 0 for pct_change")
+            continue
+        if baseline["poorRatio"] <= 0.0:
+            strict_failures.append(f"{run_id}: baseline poorRatio must be > 0 for pct_change")
+            continue
         fp_drop = -pct_change(cand["poorRatio"], baseline["poorRatio"])
         recall_gain = pct_change(cand["meanRate60s"], baseline["meanRate60s"])
         perf_growth = pct_change(cand["processMsAvg"], baseline["processMsAvg"])
@@ -450,6 +513,14 @@ def main() -> None:
         strict_failures.append("strict mode: no matched candidate details after baseline pairing")
 
     scenario_aggr = aggregate_metric_group(details, "scenarioId")
+    template_coverage_failures: List[str] = []
+    for sid in required_scenarios:
+        matched = int(scenario_aggr.get(sid, {}).get("samples", 0))
+        if matched < scenario_min_samples:
+            template_coverage_failures.append(
+                f"scenario coverage failed: {sid} samples {matched} < {scenario_min_samples}"
+            )
+
     temp_bucket_aggr = aggregate_metric_group(details, "tempBucket")
     fp_all = [float(x["fp_drop_pct"]) for x in details]
     rc_all = [float(x["recall_gain_pct"]) for x in details]
@@ -505,6 +576,8 @@ def main() -> None:
         has_labels=has_labels,
         pairing_coverage=pairing_coverage,
         config_failures=config_failures,
+        template_coverage_failures=template_coverage_failures,
+        label_required=label_required,
     )
     failures.extend(strict_failures)
     failures.extend(pairing_failures)
@@ -538,6 +611,11 @@ def main() -> None:
             "matched": pairing_matched,
             "total": pairing_total,
             "ratio": pairing_coverage,
+        },
+        "scenarioTemplateCoverage": {
+            "requiredScenarios": required_scenarios,
+            "minSamplesPerScenario": scenario_min_samples,
+            "failures": template_coverage_failures,
         },
         "pairingFailures": pairing_failures,
         "details": details,

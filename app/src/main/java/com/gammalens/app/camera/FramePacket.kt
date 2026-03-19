@@ -22,3 +22,18 @@ data class FramePacket(
  * 当 other != null 时，仅当 anchor 有 blob 且 other 无亮度突变时才触发事件。
  */
 data class ProcessableItem(val anchor: FramePacket, val other: FramePacket? = null)
+
+fun ProcessableItem.releaseMatsSafely() {
+    val anchorMat = anchor.grayMat
+    val otherMat = other?.grayMat
+    if (otherMat != null && otherMat !== anchorMat) {
+        try {
+            otherMat.release()
+        } catch (_: Exception) {
+        }
+    }
+    try {
+        anchorMat.release()
+    } catch (_: Exception) {
+    }
+}

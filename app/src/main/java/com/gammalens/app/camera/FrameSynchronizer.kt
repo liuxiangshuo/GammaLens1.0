@@ -20,7 +20,7 @@ class FrameSynchronizer(private val enablePairing: Boolean = false) {
 
     private var logCount = 0
     private val lastByStreamId = mutableMapOf<String, FramePacket>()
-    private val pairWindowNs = 50_000_000L  // 50ms
+    private var pairWindowNs = 50_000_000L  // 50ms
     private var latestPair: FramePair? = null
     private var latestPairTsNs: Long = -1L
     private var latestPairCapturedAtNs: Long = -1L
@@ -31,7 +31,12 @@ class FrameSynchronizer(private val enablePairing: Boolean = false) {
      * 提交一帧；enablePairing 时若 within window 则更新 latestPair，始终只返回一个 ProcessableItem，outCount=1。
      */
     fun submit(packet: FramePacket): List<ProcessableItem> {
-        lastByStreamId[packet.streamId] = packet
+        if (!enablePairing) {
+            return listOf(ProcessableItem(packet, null))
+        }
+        val owned = clonePacket(packet)
+        val previous = lastByStreamId.put(packet.streamId, owned)
+        releasePacket(previous)
 
         val pair = tryMakePair()
         val pairMade = pair != null
@@ -70,15 +75,16 @@ class FrameSynchronizer(private val enablePairing: Boolean = false) {
             onSyncLog?.invoke(line)
         }
 
-        val anchor = lastByStreamId.values.maxByOrNull { it.timestampNs }!!
-        val item = if (!enablePairing) {
-            ProcessableItem(packet, null)
+        val anchorOwned = lastByStreamId.values.maxByOrNull { it.timestampNs } ?: owned
+        val otherOwned = if (pair != null && pair.a.streamId != pair.b.streamId) {
+            if (pair.a.timestampNs >= pair.b.timestampNs) pair.b else pair.a
         } else {
-            val other = if (pair != null && pair.a.streamId != pair.b.streamId) {
-                if (pair.a.timestampNs >= pair.b.timestampNs) pair.b else pair.a
-            } else null
-            ProcessableItem(anchor, other)
+            null
         }
+        val item = ProcessableItem(
+            anchor = clonePacket(anchorOwned),
+            other = otherOwned?.let { clonePacket(it) },
+        )
         return listOf(item)
     }
 
@@ -100,12 +106,32 @@ class FrameSynchronizer(private val enablePairing: Boolean = false) {
      */
     fun reset() {
         logCount = 0
+        for (packet in lastByStreamId.values) {
+            releasePacket(packet)
+        }
         lastByStreamId.clear()
         latestPair = null
         latestPairTsNs = -1L
         latestPairCapturedAtNs = -1L
         latestDeltaNs = -1L
         latestPairQuality = 0.0
+    }
+
+    fun setPairWindowNs(windowNs: Long) {
+        pairWindowNs = windowNs.coerceAtLeast(1_000_000L)
+    }
+
+    private fun clonePacket(packet: FramePacket): FramePacket {
+        val matClone = packet.grayMat.clone()
+        return packet.copy(grayMat = matClone)
+    }
+
+    private fun releasePacket(packet: FramePacket?) {
+        if (packet == null) return
+        try {
+            packet.grayMat.release()
+        } catch (_: Exception) {
+        }
     }
 
     fun getLatestPairDeltaNs(): Long = latestDeltaNs
