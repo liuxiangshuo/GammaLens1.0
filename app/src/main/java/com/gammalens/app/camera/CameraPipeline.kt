@@ -532,8 +532,10 @@ class CameraPipeline(
     private fun closeCamera() {
         var acquired = false
         try {
-            cameraOpenCloseLock.acquire()
-            acquired = true
+            acquired = cameraOpenCloseLock.tryAcquire(1200, TimeUnit.MILLISECONDS)
+            if (!acquired) {
+                Log.w("GL_CAM", "closeCamera lock timeout, fallback cleanup without lock streamId=$streamId")
+            }
 
             // 安全停止重复请求 - 特别处理CAMERA_ERROR(3)
             cameraCaptureSession?.let { session ->
@@ -588,6 +590,7 @@ class CameraPipeline(
             }
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted while closing camera", e)
+            Thread.currentThread().interrupt()
         } finally {
             if (acquired) {
                 cameraOpenCloseLock.release()
@@ -618,11 +621,18 @@ class CameraPipeline(
     private fun stopBackgroundThread() {
         backgroundThread?.quitSafely()
         try {
-            backgroundThread?.join()
-            backgroundThread = null
-            backgroundHandler = null
+            backgroundThread?.join(1200L)
+            if (backgroundThread?.isAlive == true) {
+                Log.w(TAG, "Background thread join timeout, forcing quit")
+                backgroundThread?.quit()
+                backgroundThread?.join(500L)
+            }
         } catch (e: InterruptedException) {
             Log.e(TAG, "Error stopping background thread", e)
+            Thread.currentThread().interrupt()
+        } finally {
+            backgroundThread = null
+            backgroundHandler = null
         }
     }
 

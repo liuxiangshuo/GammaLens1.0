@@ -577,11 +577,14 @@ class RunSnapshotManager(private val context: Context) {
         fps: Float,
         processMsAvg: Double,
         measurementReliability: String,
+        tempSlopeCPerSec: Double,
+        stackDepthUsed: Int,
+        roiEdgeSuppressedCount: Int,
     ) {
         val dir = runDir ?: return
         val file = File(dir, "runtime_timeseries.csv")
         if (!runtimeTimeseriesHeaderWritten) {
-            file.appendText("timestampMs,riskScore,riskTriggerState,poissonConfidence,poissonRawCv,poissonCorrectedCv,poissonSampleCount,deadTimeMsUsed,tempCompPhase,warmupActive,temperatureBucket,fps,processMsAvg,measurementReliability\n")
+            file.appendText("timestampMs,riskScore,riskTriggerState,poissonConfidence,poissonRawCv,poissonCorrectedCv,poissonSampleCount,deadTimeMsUsed,tempCompPhase,warmupActive,temperatureBucket,fps,processMsAvg,measurementReliability,tempSlopeCPerSec,stackDepthUsed,roiEdgeSuppressedCount\n")
             runtimeTimeseriesHeaderWritten = true
         }
         val line = listOf(
@@ -599,6 +602,9 @@ class RunSnapshotManager(private val context: Context) {
             String.format(Locale.US, "%.2f", fps.toDouble()),
             String.format(Locale.US, "%.2f", processMsAvg),
             escapeCsv(measurementReliability),
+            String.format(Locale.US, "%.4f", tempSlopeCPerSec),
+            stackDepthUsed,
+            roiEdgeSuppressedCount,
         ).joinToString(",") + "\n"
         runtimeTimeseriesBuffer.addLast(line)
         val now = System.currentTimeMillis()

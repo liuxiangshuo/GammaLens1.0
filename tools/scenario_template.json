@@ -34,10 +34,13 @@
     "false_positive_drop": ">=12%",
     "recall_improvement": ">=2%",
     "process_ms_budget": "<=+8%",
+    "cpu_duty_budget": "<=+12%",
+    "temp_slope_abs_p95_budget": 0.08,
     "scenario_min_samples": 1,
     "allow_baseline_fallback": false,
     "strict_mode": true,
-    "pairing_coverage_min": 1.0
+    "pairing_coverage_min": 1.0,
+    "labels_must_exist": false
   },
   "batch_eval": {
     "experimentId": "prod",

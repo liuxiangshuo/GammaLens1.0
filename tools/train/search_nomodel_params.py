@@ -14,19 +14,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-PARAM_KEYS = [
-    "cusumDriftK",
-    "cusumThresholdH",
-    "cusumDecay",
-    "pulseDensityMin",
-    "minNeighborhoodConsistency",
-    "minTrackStabilityConfirm",
-]
+PARAM_SPECS: Dict[str, Dict[str, float | str]] = {
+    "riskScoreTriggerHigh": {"default": 0.68, "min": 0.55, "max": 0.85, "type": "float"},
+    "riskScoreReleaseLow": {"default": 0.52, "min": 0.40, "max": 0.70, "type": "float"},
+    "riskWeightPoisson": {"default": 0.35, "min": 0.20, "max": 0.50, "type": "float"},
+    "riskWeightCusum": {"default": 0.25, "min": 0.10, "max": 0.40, "type": "float"},
+    "riskWeightStability": {"default": 0.20, "min": 0.10, "max": 0.35, "type": "float"},
+    "riskWeightQuality": {"default": 0.20, "min": 0.10, "max": 0.35, "type": "float"},
+    "poissonConfidenceMin": {"default": 0.45, "min": 0.35, "max": 0.70, "type": "float"},
+    "deadTimeDropTarget": {"default": 0.16, "min": 0.08, "max": 0.30, "type": "float"},
+    "deadTimeDropFeedbackGain": {"default": 0.35, "min": 0.10, "max": 0.60, "type": "float"},
+    "frameStackDepth": {"default": 5.0, "min": 3.0, "max": 8.0, "type": "int"},
+    "frameStackThreshold": {"default": 0.40, "min": 0.25, "max": 0.60, "type": "float"},
+    "pulseDensityMin": {"default": 0.08, "min": 0.04, "max": 0.20, "type": "float"},
+}
+PARAM_KEYS = list(PARAM_SPECS.keys())
 
 
 @dataclass
@@ -63,14 +71,15 @@ def build_rows(runs_dir: Path) -> List[RunRow]:
         runtime = summary_obj.get("runtimeMetrics", {})
         reliability = runtime.get("reliabilitySamples", {})
         params: Dict[str, float] = {}
-        ok = True
         for k in PARAM_KEYS:
-            if k not in det:
-                ok = False
-                break
-            params[k] = float(det.get(k, 0.0))
-        if not ok:
-            continue
+            raw = det.get(k, PARAM_SPECS[k]["default"])
+            try:
+                value = float(raw)
+            except Exception:
+                value = float(PARAM_SPECS[k]["default"])
+            if not math.isfinite(value):
+                value = float(PARAM_SPECS[k]["default"])
+            params[k] = value
         row = RunRow(
             run_id=summary_path.parent.name,
             params=params,
@@ -87,6 +96,46 @@ def normalize(v: float, lo: float, hi: float) -> float:
     if hi <= lo:
         return 0.0
     return (v - lo) / (hi - lo)
+
+
+def clamp_value(key: str, value: float) -> float:
+    spec = PARAM_SPECS[key]
+    lo = float(spec["min"])
+    hi = float(spec["max"])
+    v = max(lo, min(hi, value))
+    if spec["type"] == "int":
+        return float(int(round(v)))
+    return float(v)
+
+
+def clamp_params(params: Dict[str, float]) -> Dict[str, float]:
+    return {k: clamp_value(k, float(params.get(k, PARAM_SPECS[k]["default"]))) for k in PARAM_KEYS}
+
+
+def generate_local_candidates(base_params: Dict[str, float]) -> List[Dict[str, float]]:
+    base = clamp_params(base_params)
+    candidates: List[Dict[str, float]] = [base]
+    for key in PARAM_KEYS:
+        spec = PARAM_SPECS[key]
+        lo = float(spec["min"])
+        hi = float(spec["max"])
+        span = hi - lo
+        if span <= 0:
+            continue
+        delta = span * 0.08
+        for direction in (-1.0, 1.0):
+            c = dict(base)
+            c[key] = clamp_value(key, c[key] + direction * delta)
+            candidates.append(c)
+    dedup: List[Dict[str, float]] = []
+    seen = set()
+    for c in candidates:
+        key = tuple((k, c[k]) for k in PARAM_KEYS)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(c)
+    return dedup
 
 
 def rank_profiles(rows: List[RunRow]) -> Dict[str, Dict[str, float]]:
@@ -118,9 +167,9 @@ def rank_profiles(rows: List[RunRow]) -> Dict[str, Dict[str, float]]:
     sensitive_best = max(scored, key=lambda x: x[3])[0]
 
     return {
-        "stable": stable_best.params,
-        "balanced": balanced_best.params,
-        "sensitive": sensitive_best.params,
+        "stable": clamp_params(stable_best.params),
+        "balanced": clamp_params(balanced_best.params),
+        "sensitive": clamp_params(sensitive_best.params),
     }
 
 
@@ -134,11 +183,22 @@ def main() -> None:
     if len(rows) < 3:
         raise SystemExit("有效runs不足（需要至少3个，且含 params.json + summary.json）")
     profiles = rank_profiles(rows)
+    candidate_sets = {
+        "stable": generate_local_candidates(profiles["stable"])[:10],
+        "balanced": generate_local_candidates(profiles["balanced"])[:10],
+        "sensitive": generate_local_candidates(profiles["sensitive"])[:10],
+    }
     payload = {
-        "modelVersion": "v7a-r0-nomodel-auto",
+        "modelVersion": "v8-r3-nomodel-auto",
         "samples": len(rows),
         "paramKeys": PARAM_KEYS,
+        "searchSpace": {
+            key: {"default": spec["default"], "min": spec["min"], "max": spec["max"], "type": spec["type"]}
+            for key, spec in PARAM_SPECS.items()
+        },
         "profiles": profiles,
+        "generatedCandidates": candidate_sets,
+        "sourceRunIds": sorted({r.run_id for r in rows}),
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

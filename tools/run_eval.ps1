@@ -1,7 +1,7 @@
 param(
     [string]$Baseline = "runs/baseline",
     [string]$Candidates = "runs/candidates",
-    [string]$Labels = "tools/labeling/labels.csv",
+    [string]$Labels = "",
     [string]$ScenarioTemplate = "tools/scenario_template.json",
     [string]$ReportOut = "tools/reports/report_final.json"
 )
@@ -32,7 +32,7 @@ $pipelineArgs = @(
     "--report_out", $ReportOut
 )
 
-if (Test-Path $Labels) {
+if ($Labels -and (Test-Path $Labels)) {
     $pipelineArgs += @("--labels", $Labels)
 }
 

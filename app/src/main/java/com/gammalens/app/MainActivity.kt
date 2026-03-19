@@ -104,6 +104,8 @@ class MainActivity : AppCompatActivity() {
     private var dispatchThread: HandlerThread? = null
     private var dispatchHandler: Handler? = null
     private var primaryOnlyLogged = false
+    @Volatile private var stopInProgress = false
+    private val stopLock = Any()
     private val uiUpdateHandler = Handler(Looper.getMainLooper())
     private val uiUpdateRunnable = object : Runnable {
         override fun run() {
@@ -407,6 +409,12 @@ class MainActivity : AppCompatActivity() {
         isResumed = false
     }
 
+    override fun onStop() {
+        super.onStop()
+        // onPause 之外的兜底路径，保证资源释放幂等。
+        stopCameraPreview()
+    }
+
     /**
      * 权限请求结果回调
      */
@@ -437,6 +445,10 @@ class MainActivity : AppCompatActivity() {
     private fun tryStartPipeline() {
         // 条件检查：必须 resumed + texture ready + 权限OK + 未启动过
         if (!isResumed || !isTextureReady) {
+            return
+        }
+        if (stopInProgress) {
+            Log.i(TAG, "Skip tryStartPipeline while stop is in progress")
             return
         }
 
@@ -1142,6 +1154,9 @@ class MainActivity : AppCompatActivity() {
             fps = s.fps,
             processMsAvg = s.processMsAvg,
             measurementReliability = s.measurementReliability.name,
+            tempSlopeCPerSec = s.tempSlopeCPerSec,
+            stackDepthUsed = s.stackDepthUsed,
+            roiEdgeSuppressedCount = s.roiEdgeSuppressedCount,
         )
     }
 
@@ -1188,24 +1203,44 @@ class MainActivity : AppCompatActivity() {
      * 停止相机预览
      */
     private fun stopCameraPreview() {
-        pipeline0?.stop()
-        pipeline1?.stop()
+        synchronized(stopLock) {
+            if (stopInProgress) return
+            stopInProgress = true
+        }
+        val runStop = {
+            try {
+                pipeline0?.stop()
+                pipeline1?.stop()
 
-        stopDispatchThread()
-        applyOnlineCalibrationIfNeeded()
-        runSnapshotManager?.endSession(debugLogRepository)
+                stopDispatchThread()
+                applyOnlineCalibrationIfNeeded()
+                runSnapshotManager?.endSession(debugLogRepository)
 
-        // 清理资源
-        sharedSync.reset()
-        frameProcessor.close()
+                // 清理资源
+                sharedSync.reset()
+                frameProcessor.close()
 
-        // 重置日志状态
-        loggedFirstFrameStreams.clear()
-        primaryOnlyLogged = false
+                // 重置日志状态
+                loggedFirstFrameStreams.clear()
+                primaryOnlyLogged = false
 
-        // 重置引用
-        pipeline0 = null
-        pipeline1 = null
+                // 重置引用
+                pipeline0 = null
+                pipeline1 = null
+            } catch (e: Exception) {
+                Log.w(TAG, "stopCameraPreview failed: ${e.message}")
+            } finally {
+                stopInProgress = false
+                if (isResumed && isTextureReady && !requestedStart) {
+                    runOnUiThread { tryStartPipeline() }
+                }
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Thread({ runStop() }, "PreviewStop").start()
+        } else {
+            runStop()
+        }
     }
 
     private fun applyOnlineCalibrationIfNeeded() {
@@ -1365,7 +1400,12 @@ class MainActivity : AppCompatActivity() {
         }
         t.quitSafely()
         try {
-            t.join(2_500L)
+            t.join(1_000L)
+            if (t.isAlive) {
+                Log.w("GL_DISPATCH", "join timeout, forcing quit")
+                t.quit()
+                t.join(500L)
+            }
         } catch (e: InterruptedException) {
             Log.w("GL_DISPATCH", "join interrupted: ${e.message}")
             Thread.currentThread().interrupt()

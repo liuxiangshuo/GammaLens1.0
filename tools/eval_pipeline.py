@@ -24,6 +24,7 @@ def extract(summary: dict) -> Dict[str, float]:
         "poorRatio": float(reliability.get("poorRatio", 1.0)),
         "meanRate60s": float(summary.get("meanRate60s", 0.0)),
         "processMsAvg": float(runtime.get("processMsAvg", 0.0)),
+        "fps": float(runtime.get("fps", 0.0)),
         "scenarioId": str(runtime.get("scenarioId", summary.get("scenarioId", "unknown"))),
         "tempBucket": str(runtime.get("temperatureBucket", "unknown")),
         "modelVersion": str(runtime.get("modelVersion", summary.get("modelVersion", "unknown"))),
@@ -136,6 +137,66 @@ def parse_budget_percent(expr: str) -> float:
     return float(cleaned)
 
 
+def parse_numeric_expr(expr: object, field_name: str) -> float:
+    if expr is None:
+        raise ValueError(f"{field_name} is missing")
+    if isinstance(expr, (int, float)):
+        value = float(expr)
+    else:
+        text = str(expr).strip()
+        if not text:
+            raise ValueError(f"{field_name} is empty")
+        cleaned = (
+            text.replace(">=", "")
+            .replace("<=", "")
+            .replace(">", "")
+            .replace("<", "")
+            .replace("+", "")
+            .replace("%", "")
+            .strip()
+        )
+        if not cleaned:
+            raise ValueError(f"{field_name} has invalid format: {expr!r}")
+        value = float(cleaned)
+    if not math.isfinite(value):
+        raise ValueError(f"{field_name} must be finite, got {expr!r}")
+    return value
+
+
+def validate_targets_schema(targets: dict, strict_mode: bool) -> List[str]:
+    errors: List[str] = []
+    required_fields = ("false_positive_drop", "recall_improvement", "process_ms_budget")
+    for field in required_fields:
+        if field not in targets:
+            errors.append(f"targets.{field} is required")
+    for field in required_fields:
+        if field in targets:
+            try:
+                value = parse_numeric_expr(targets.get(field), f"targets.{field}")
+                if value < 0.0:
+                    errors.append(f"targets.{field} must be >= 0, got {value}")
+            except ValueError as exc:
+                errors.append(str(exc))
+    for field in ("pairing_coverage_min", "label_precision_min", "label_recall_min", "label_f1_min"):
+        if field in targets:
+            try:
+                value = parse_numeric_expr(targets.get(field), f"targets.{field}")
+                if not (0.0 <= value <= 1.0):
+                    errors.append(f"targets.{field} must be within [0,1], got {value}")
+            except ValueError as exc:
+                errors.append(str(exc))
+    if "scenario_min_samples" in targets:
+        try:
+            scenario_min_samples = int(targets.get("scenario_min_samples", 1))
+            if scenario_min_samples < 1:
+                errors.append("targets.scenario_min_samples must be >= 1")
+        except Exception:
+            errors.append(f"targets.scenario_min_samples must be integer, got {targets.get('scenario_min_samples')!r}")
+    if strict_mode and parse_bool(targets.get("allow_baseline_fallback"), default=False):
+        errors.append("strict mode does not allow targets.allow_baseline_fallback=true")
+    return errors
+
+
 def parse_ratio(expr: object, default: float) -> float:
     if expr is None:
         return default
@@ -241,15 +302,29 @@ def collect_missing_required_fields(summary: dict) -> List[str]:
 
 def build_timeseries_diag(rows: List[Dict[str, str]]) -> Dict[str, float]:
     if not rows:
-        return {"risk_jitter_count": 0.0, "warmup_poor_ratio_60s": 0.0, "process_ms_p95": 0.0, "samples": 0}
+        return {
+            "risk_jitter_count": 0.0,
+            "warmup_poor_ratio_60s": 0.0,
+            "process_ms_p95": 0.0,
+            "temp_slope_abs_p95": 0.0,
+            "cpu_duty_proxy_avg": 0.0,
+            "samples": 0,
+        }
     risk_scores: List[float] = []
     process_values: List[float] = []
+    cpu_duty_values: List[float] = []
+    temp_slope_abs_values: List[float] = []
     timestamps: List[int] = []
     reliability: List[str] = []
     for row in rows:
         try:
             risk_scores.append(float(row.get("riskScore", "0") or 0.0))
-            process_values.append(float(row.get("processMsAvg", "0") or 0.0))
+            process_val = float(row.get("processMsAvg", "0") or 0.0)
+            fps_val = float(row.get("fps", "0") or 0.0)
+            temp_slope_val = float(row.get("tempSlopeCPerSec", "0") or 0.0)
+            process_values.append(process_val)
+            cpu_duty_values.append(process_val * fps_val)
+            temp_slope_abs_values.append(abs(temp_slope_val))
             timestamps.append(int(float(row.get("timestampMs", "0") or 0)))
             reliability.append(str(row.get("measurementReliability", "")).strip().upper())
         except ValueError:
@@ -268,6 +343,8 @@ def build_timeseries_diag(rows: List[Dict[str, str]]) -> Dict[str, float]:
         "risk_jitter_count": float(jitter),
         "warmup_poor_ratio_60s": float(warmup_poor_ratio),
         "process_ms_p95": percentile(process_values, 0.95),
+        "temp_slope_abs_p95": percentile(temp_slope_abs_values, 0.95),
+        "cpu_duty_proxy_avg": (sum(cpu_duty_values) / len(cpu_duty_values)) if cpu_duty_values else 0.0,
         "samples": len(risk_scores),
     }
 
@@ -281,6 +358,8 @@ def aggregate_metric_group(details: List[dict], key: str) -> Dict[str, Dict[str,
         fp_vals = [float(r["fp_drop_pct"]) for r in rows]
         rc_vals = [float(r["recall_gain_pct"]) for r in rows]
         pf_vals = [float(r["perf_growth_pct"]) for r in rows]
+        cpu_duty_vals = [float(r.get("cpu_duty_growth_pct", 0.0)) for r in rows]
+        temp_slope_vals = [float(r.get("temp_slope_abs_p95", 0.0)) for r in rows]
         jitter_vals = [float(r.get("risk_jitter_count", 0.0)) for r in rows]
         warmup_vals = [float(r.get("warmup_poor_ratio_60s", 0.0)) for r in rows]
         p95_vals = [float(r.get("process_ms_p95", 0.0)) for r in rows]
@@ -289,6 +368,8 @@ def aggregate_metric_group(details: List[dict], key: str) -> Dict[str, Dict[str,
             "fp_drop_pct": sum(fp_vals) / len(fp_vals) if fp_vals else 0.0,
             "recall_gain_pct": sum(rc_vals) / len(rc_vals) if rc_vals else 0.0,
             "perf_growth_pct": sum(pf_vals) / len(pf_vals) if pf_vals else 0.0,
+            "cpu_duty_growth_pct": sum(cpu_duty_vals) / len(cpu_duty_vals) if cpu_duty_vals else 0.0,
+            "temp_slope_abs_p95": sum(temp_slope_vals) / len(temp_slope_vals) if temp_slope_vals else 0.0,
             "risk_jitter_count_avg": sum(jitter_vals) / len(jitter_vals) if jitter_vals else 0.0,
             "warmup_poor_ratio_60s_avg": sum(warmup_vals) / len(warmup_vals) if warmup_vals else 0.0,
             "process_ms_p95_avg": sum(p95_vals) / len(p95_vals) if p95_vals else 0.0,
@@ -316,6 +397,12 @@ def evaluate_gate(
     fp_target = parse_target_percent(str(targets.get("false_positive_drop", ">=12%")))
     recall_target = parse_target_percent(str(targets.get("recall_improvement", ">=2%")))
     perf_budget = parse_budget_percent(str(targets.get("process_ms_budget", "<=+8%")))
+    cpu_duty_budget = None
+    if "cpu_duty_budget" in targets:
+        cpu_duty_budget = parse_budget_percent(str(targets.get("cpu_duty_budget")))
+    temp_slope_budget = None
+    if "temp_slope_abs_p95_budget" in targets:
+        temp_slope_budget = parse_numeric_expr(targets.get("temp_slope_abs_p95_budget"), "targets.temp_slope_abs_p95_budget")
     for sid, row in scenario_aggr.items():
         if row["fp_drop_pct"] < fp_target:
             failures.append(f"{sid}: fp_drop {row['fp_drop_pct']:.2f}% < {fp_target:.2f}%")
@@ -323,6 +410,10 @@ def evaluate_gate(
             failures.append(f"{sid}: recall_gain {row['recall_gain_pct']:.2f}% < {recall_target:.2f}%")
         if row["perf_growth_pct"] > perf_budget:
             failures.append(f"{sid}: perf_growth +{row['perf_growth_pct']:.2f}% > +{perf_budget:.2f}%")
+        if cpu_duty_budget is not None and float(row.get("cpu_duty_growth_pct", 0.0)) > cpu_duty_budget:
+            failures.append(f"{sid}: cpu_duty_growth +{float(row.get('cpu_duty_growth_pct', 0.0)):.2f}% > +{cpu_duty_budget:.2f}%")
+        if temp_slope_budget is not None and float(row.get("temp_slope_abs_p95", 0.0)) > temp_slope_budget:
+            failures.append(f"{sid}: temp_slope_abs_p95 {float(row.get('temp_slope_abs_p95', 0.0)):.4f} > {temp_slope_budget:.4f}")
     pairing_min = parse_ratio(targets.get("pairing_coverage_min"), 0.90)
     if pairing_coverage < pairing_min:
         failures.append(f"pairing coverage {pairing_coverage:.3f} < {pairing_min:.3f}")
@@ -426,6 +517,9 @@ def main() -> None:
     strict_mode = args.strict or parse_bool(targets.get("strict_mode"), default=False)
     allow_baseline_fallback = parse_bool(targets.get("allow_baseline_fallback"), default=False)
     label_required = parse_bool(targets.get("label_required"), default=False)
+    target_schema_errors = validate_targets_schema(targets, strict_mode=strict_mode)
+    if target_schema_errors:
+        raise SystemExit("scenario_template targets validation failed: " + "; ".join(target_schema_errors))
     if strict_mode and not required_scenarios:
         raise SystemExit("strict mode requires non-empty scenarios in scenario_template")
     scenario_min_samples = int(targets.get("scenario_min_samples", 1))
@@ -438,18 +532,40 @@ def main() -> None:
 
     label_map: Dict[str, Dict[str, int]] = {}
     has_labels = False
+    warnings: List[str] = []
     if args.labels:
         labels_path = Path(args.labels)
         if labels_path.exists():
             label_map = load_labels(labels_path)
             has_labels = True
+        else:
+            message = f"labels file not found: {labels_path}"
+            if strict_mode or parse_bool(targets.get("labels_must_exist"), default=False):
+                raise SystemExit(message)
+            warnings.append(message)
+
+    run_id_to_paths: Dict[str, List[str]] = {}
+    for candidate_path in candidate_paths:
+        run_id = candidate_path.parent.name
+        run_id_to_paths.setdefault(run_id, []).append(str(candidate_path))
+    duplicate_run_ids = {
+        run_id: paths for run_id, paths in run_id_to_paths.items() if len(paths) > 1
+    }
 
     details: List[dict] = []
     agg_label = {"tp": 0.0, "fp": 0.0, "fn_proxy": 0.0}
     scenario_label_counts: Dict[str, Dict[str, float]] = {}
     pairing_failures: List[str] = []
     strict_failures: List[str] = []
+    if duplicate_run_ids:
+        for run_id, paths in sorted(duplicate_run_ids.items()):
+            strict_failures.append(
+                f"duplicate run_id detected: {run_id}, paths={paths}"
+            )
     for candidate_path in candidate_paths:
+        run_id = candidate_path.parent.name
+        if run_id in duplicate_run_ids:
+            continue
         raw_summary = load_json(candidate_path)
         if strict_mode:
             missing = collect_missing_required_fields(raw_summary)
@@ -468,12 +584,17 @@ def main() -> None:
                 f"{candidate_path.parent.name}: no baseline match for scenario={cand['scenarioId']} tempBucket={cand['tempBucket']}"
             )
             continue
-        run_id = candidate_path.parent.name
         if baseline["meanRate60s"] <= 0.0:
             strict_failures.append(f"{run_id}: baseline meanRate60s must be > 0 for pct_change")
             continue
         if baseline["processMsAvg"] <= 0.0:
             strict_failures.append(f"{run_id}: baseline processMsAvg must be > 0 for pct_change")
+            continue
+        if baseline["fps"] <= 0.0:
+            strict_failures.append(f"{run_id}: baseline fps must be > 0 for cpu duty proxy")
+            continue
+        if cand["fps"] <= 0.0:
+            strict_failures.append(f"{run_id}: candidate fps must be > 0 for cpu duty proxy")
             continue
         if baseline["poorRatio"] <= 0.0:
             strict_failures.append(f"{run_id}: baseline poorRatio must be > 0 for pct_change")
@@ -481,6 +602,12 @@ def main() -> None:
         fp_drop = -pct_change(cand["poorRatio"], baseline["poorRatio"])
         recall_gain = pct_change(cand["meanRate60s"], baseline["meanRate60s"])
         perf_growth = pct_change(cand["processMsAvg"], baseline["processMsAvg"])
+        baseline_cpu_duty = baseline["fps"] * baseline["processMsAvg"]
+        candidate_cpu_duty = cand["fps"] * cand["processMsAvg"]
+        if baseline_cpu_duty <= 0.0:
+            strict_failures.append(f"{run_id}: baseline cpu duty proxy must be > 0")
+            continue
+        cpu_duty_growth = pct_change(candidate_cpu_duty, baseline_cpu_duty)
         diag = build_timeseries_diag(load_runtime_timeseries(candidate_path.parent))
         row = {
             "run": run_id,
@@ -491,9 +618,12 @@ def main() -> None:
             "fp_drop_pct": fp_drop,
             "recall_gain_pct": recall_gain,
             "perf_growth_pct": perf_growth,
+            "cpu_duty_growth_pct": cpu_duty_growth,
             "risk_jitter_count": diag["risk_jitter_count"],
             "warmup_poor_ratio_60s": diag["warmup_poor_ratio_60s"],
             "process_ms_p95": diag["process_ms_p95"],
+            "temp_slope_abs_p95": diag["temp_slope_abs_p95"],
+            "cpu_duty_proxy_avg": diag["cpu_duty_proxy_avg"],
             "timeseries_samples": diag["samples"],
         }
         if run_id in label_map:
@@ -528,6 +658,8 @@ def main() -> None:
     jitter_all = [float(x["risk_jitter_count"]) for x in details]
     warmup_all = [float(x["warmup_poor_ratio_60s"]) for x in details]
     p95_all = [float(x["process_ms_p95"]) for x in details]
+    cpu_duty_all = [float(x.get("cpu_duty_growth_pct", 0.0)) for x in details]
+    temp_slope_all = [float(x.get("temp_slope_abs_p95", 0.0)) for x in details]
     overall_ci = {
         "fp_drop_ci95": bootstrap_ci(fp_all),
         "recall_gain_ci95": bootstrap_ci(rc_all),
@@ -539,6 +671,8 @@ def main() -> None:
         "risk_jitter_count_avg": sum(jitter_all) / len(jitter_all) if jitter_all else 0.0,
         "warmup_poor_ratio_60s_avg": sum(warmup_all) / len(warmup_all) if warmup_all else 0.0,
         "process_ms_p95_avg": sum(p95_all) / len(p95_all) if p95_all else 0.0,
+        "cpu_duty_growth_pct_avg": sum(cpu_duty_all) / len(cpu_duty_all) if cpu_duty_all else 0.0,
+        "temp_slope_abs_p95_avg": sum(temp_slope_all) / len(temp_slope_all) if temp_slope_all else 0.0,
     }
 
     label_gate = None
@@ -607,6 +741,7 @@ def main() -> None:
         },
         "strictMode": strict_mode,
         "strictFailures": strict_failures,
+        "warnings": warnings,
         "pairingCoverage": {
             "matched": pairing_matched,
             "total": pairing_total,

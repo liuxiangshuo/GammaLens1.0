@@ -126,6 +126,7 @@ class FrameProcessor(
     @Volatile private var config: DetectionConfig = initialConfig.deepCopy()
     @Volatile private var frameConfigSnapshot: DetectionConfig? = null
     @Volatile private var roiWeightsDirty: Boolean = true
+    @Volatile private var closeInProgress: Boolean = false
 
     /** Called every ~1s with FPS/耗时/检测统计。 */
     var onStatsSnapshot: ((FrameStatsSnapshot) -> Unit)? = null
@@ -301,6 +302,7 @@ class FrameProcessor(
 
     @Synchronized
     fun updateConfig(newConfig: DetectionConfig) {
+        if (closeInProgress) return
         val prev = config
         val next = newConfig.deepCopy()
         val roiChanged = prev.roiWeightEnabled != next.roiWeightEnabled ||
@@ -314,6 +316,7 @@ class FrameProcessor(
     }
 
     fun updateDeviceTempC(tempC: Double?) {
+        if (closeInProgress) return
         if (tempC == null || tempC.isNaN()) return
         val clamped = tempC.coerceIn(-10.0, 80.0)
         val now = SystemClock.elapsedRealtime()
@@ -329,10 +332,12 @@ class FrameProcessor(
     }
 
     fun setShadedPrecisionMode(enabled: Boolean) {
+        if (closeInProgress) return
         shadedPrecisionMode = enabled
     }
 
     fun updateHotPixelMap(points: List<Pair<Int, Int>>, bucket: String) {
+        if (closeInProgress) return
         hotPixelMapBucket = bucket
         hotPixelMapSize = points.size
         if (!::staticHotPixelMask.isInitialized) return
@@ -349,6 +354,7 @@ class FrameProcessor(
     }
 
     fun snapshotLearnedHotPixels(maxPoints: Int): List<Pair<Int, Int>> {
+        if (closeInProgress) return emptyList()
         if (!::hotPixelMask.isInitialized || maxPoints <= 0) return emptyList()
         val points = mutableListOf<Pair<Int, Int>>()
         for (y in 0 until hotPixelMask.rows()) {
@@ -472,6 +478,10 @@ class FrameProcessor(
      * 双摄时：仅当 anchor 有 blob 且 other 无亮度突变时才触发事件（共模抑制）。
      */
     fun consume(item: ProcessableItem) {
+        if (closeInProgress) {
+            item.releaseMatsSafely()
+            return
+        }
         val startNs = System.nanoTime()
         val frame = item.anchor
         val nowMs = SystemClock.elapsedRealtime()
@@ -1659,7 +1669,11 @@ class FrameProcessor(
      * 清理资源（在FrameProcessor生命周期结束时调用）
      * 幂等：可以重复调用
      */
+    @Synchronized
     fun close() {
+        if (closeInProgress) return
+        closeInProgress = true
+        try {
         backgroundSubtractor = null
         previousAlignedFrame?.release()
         previousAlignedFrame = null
@@ -1796,5 +1810,8 @@ class FrameProcessor(
         // 重置缓存状态
         cachedW = 0
         cachedH = 0
+        } finally {
+            closeInProgress = false
+        }
     }
 }

@@ -364,6 +364,48 @@ class DetectionConfig {
     }
 
     companion object {
+        @JvmField
+        val AUTO_TUNE_PARAM_GROUPS: Map<String, List<String>> = mapOf(
+            "risk_fusion" to listOf(
+                "riskScoreTriggerHigh",
+                "riskScoreReleaseLow",
+                "riskWeightPoisson",
+                "riskWeightCusum",
+                "riskWeightStability",
+                "riskWeightQuality",
+            ),
+            "poisson_deadtime" to listOf(
+                "poissonConfidenceMin",
+                "deadTimeDropTarget",
+                "deadTimeDropFeedbackGain",
+                "deadTimeMsMin",
+                "deadTimeMsMax",
+            ),
+            "roi_stack" to listOf(
+                "frameStackDepth",
+                "frameStackThreshold",
+                "pulseDensityMin",
+            ),
+        )
+
+        @JvmField
+        val AUTO_TUNE_PARAM_BOUNDS: Map<String, Pair<Double, Double>> = mapOf(
+            "riskScoreTriggerHigh" to (0.55 to 0.85),
+            "riskScoreReleaseLow" to (0.40 to 0.70),
+            "riskWeightPoisson" to (0.20 to 0.50),
+            "riskWeightCusum" to (0.10 to 0.40),
+            "riskWeightStability" to (0.10 to 0.35),
+            "riskWeightQuality" to (0.10 to 0.35),
+            "poissonConfidenceMin" to (0.35 to 0.70),
+            "deadTimeDropTarget" to (0.08 to 0.30),
+            "deadTimeDropFeedbackGain" to (0.10 to 0.60),
+            "deadTimeMsMin" to (40.0 to 140.0),
+            "deadTimeMsMax" to (160.0 to 320.0),
+            "frameStackDepth" to (3.0 to 8.0),
+            "frameStackThreshold" to (0.25 to 0.60),
+            "pulseDensityMin" to (0.04 to 0.20),
+        )
+
         @JvmStatic
         fun defaultInstance(): DetectionConfig = DetectionConfig().apply { normalizeInPlace() }
     }
